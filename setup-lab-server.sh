@@ -403,7 +403,26 @@ wizard_network() {
 # =============================================================================
 wizard_domain_and_hosts() {
     echo "--- Domain Configuration ---"
-    prompt_value "Domain name" "${CLI_DOMAIN:-aelab.com}" DOMAIN is_valid_domain
+    if [[ -n "$CLI_DOMAIN" ]]; then
+        prompt_value "Domain name" "$CLI_DOMAIN" DOMAIN is_valid_domain
+    else
+        # No stand-in default here on purpose: this value flows into every
+        # BIND zone, vhost, and mail hostname below, so we require the
+        # person to actually type their own domain rather than risk them
+        # hitting Enter and accepting an unrelated example domain.
+        while true; do
+            read -r -p "Domain name (e.g. domain.com): " DOMAIN
+            if [[ -z "$DOMAIN" ]]; then
+                echo "  -> This field is required. Enter the domain name for this lab."
+                continue
+            fi
+            if ! is_valid_domain "$DOMAIN"; then
+                echo "  -> Invalid value. Please try again."
+                continue
+            fi
+            break
+        done
+    fi
 
     echo
     echo "--- Hostname Configuration ---"
@@ -1399,6 +1418,30 @@ EOF
 }
 
 # =============================================================================
+# OPTIONAL REBOOT
+# =============================================================================
+offer_reboot() {
+    cat <<EOF
+
+===============================================
+ Reboot
+===============================================
+Nothing above strictly requires a reboot: netplan was applied live, and
+every service (BIND9, Apache2, Postfix, Dovecot, UFW) was already
+restarted and validated. A reboot is optional -- it's mainly useful to
+confirm everything comes back up cleanly on a cold boot (all services
+are enabled via systemd, so they should start automatically).
+EOF
+    if prompt_yn "Reboot now?" "N"; then
+        warn "Rebooting in 5 seconds... (Ctrl+C to cancel)"
+        sleep 5
+        reboot
+    else
+        info "Skipping reboot. You can reboot later with: sudo reboot"
+    fi
+}
+
+# =============================================================================
 # MAIN
 # =============================================================================
 main() {
@@ -1451,6 +1494,7 @@ main() {
     run_validation
 
     print_summary
+    offer_reboot
 }
 
 main "$@"
