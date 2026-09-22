@@ -506,11 +506,15 @@ compute_derived_values() {
     IFS='.' read -r OCT1 OCT2 OCT3 OCT4 <<< "$SERVER_IP"
     NETWORK_ADDR=$(compute_network_address "$SERVER_IP" "$NETWORK_CIDR")
 
-    if [[ "$NETWORK_CIDR" != "24" ]]; then
-        warn "Reverse DNS zone generation assumes a /24 network boundary for simplicity."
-        warn "You configured a /${NETWORK_CIDR} network; the reverse zone will still be"
-        warn "generated on a /24 (${OCT1}.${OCT2}.${OCT3}.0/24) basis and may need manual adjustment."
-    fi
+    # The reverse (PTR) zone is scoped to the /24 that contains SERVER_IP,
+    # regardless of what NETWORK_CIDR you chose (/30, /28, /24, /16 ...).
+    # This is not an approximation: this script only ever publishes ONE PTR
+    # record -- for the server's own address -- and a standard /24
+    # in-addr.arpa zone is the correct, valid place to publish it no matter
+    # how large or small your actual subnet is. Classless (sub-/24) reverse
+    # delegation via RFC 2317 only matters when multiple separate
+    # organizations need to split authority over one /24, which doesn't
+    # apply here since this server is the sole authority for its own lab.
     REVERSE_ZONE="${OCT3}.${OCT2}.${OCT1}.in-addr.arpa"
     REVERSE_ZONE_FILE_NAME="db.${OCT1}.${OCT2}.${OCT3}"
 }
