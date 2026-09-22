@@ -94,27 +94,39 @@ require_root() {
     fi
 }
 
+OS_ID=""; OS_VERSION=""
+
 check_os() {
     info "Checking operating system..."
-    local id="" ver=""
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         source /etc/os-release
-        id="${ID:-unknown}"
-        ver="${VERSION_ID:-unknown}"
+        OS_ID="${ID:-unknown}"
+        OS_VERSION="${VERSION_ID:-unknown}"
     fi
 
-    if [[ "$id" == "ubuntu" && "$ver" == "24.04" ]]; then
-        ok "Ubuntu 24.04 LTS confirmed."
-        return 0
-    fi
+    case "${OS_ID}-${OS_VERSION}" in
+        ubuntu-24.04)
+            ok "Ubuntu 24.04 LTS confirmed."
+            return 0
+            ;;
+        debian-12)
+            ok "Debian 12 (bookworm) confirmed."
+            return 0
+            ;;
+        ubuntu-22.04|ubuntu-20.04)
+            ok "Ubuntu ${OS_VERSION} confirmed (older LTS -- primarily tested on 24.04, but this"
+            ok "should work: package names and service units are unchanged)."
+            return 0
+            ;;
+    esac
 
-    warn "This script is designed and tested for Ubuntu Server 24.04 LTS."
-    warn "Detected: ID='${id}' VERSION='${ver}'."
+    warn "This script is designed and tested for Ubuntu Server 24.04 LTS and Debian 12 (bookworm)."
+    warn "Detected: ID='${OS_ID}' VERSION='${OS_VERSION}'."
     warn "Running on an unsupported OS may produce broken or inconsistent results."
     read -r -p "Continue anyway on this unsupported OS? [y/N]: " ans
     if [[ "${ans,,}" != "y" ]]; then
-        echo "Aborting. Re-run on Ubuntu Server 24.04 LTS."
+        echo "Aborting. Re-run on Ubuntu Server 24.04 LTS or Debian 12."
         exit 1
     fi
 }
@@ -185,6 +197,11 @@ compute_network_address() {
     ipi=$(ip_to_int "$ip")
     maski=$(cidr_to_mask_int "$cidr")
     int_to_ip $(( ipi & maski ))
+}
+
+cidr_to_netmask() {
+    local cidr="$1"
+    int_to_ip "$(cidr_to_mask_int "$cidr")"
 }
 
 # =============================================================================
@@ -581,56 +598,22 @@ install_packages() {
 # =============================================================================
 # NETWORK CONFIGURATION (safe: detect, show, warn, confirm)
 # =============================================================================
-configure_network() {
-    local current_ip
-    current_ip=$(ip -o -4 addr show dev "$NETWORK_INTERFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
-
-    echo
-    echo "=========================================================="
-    echo " Interface          : $NETWORK_INTERFACE"
-    echo " Current IPv4 on it : ${current_ip:-none}"
-    echo " Requested Address  : ${SERVER_IP}/${NETWORK_CIDR}"
-    echo " Requested Gateway  : ${GATEWAY:-<none>}"
-    echo "=========================================================="
-
-    if [[ "$current_ip" == "$SERVER_IP" ]]; then
-        ok "Interface $NETWORK_INTERFACE already has the required IP. No network change needed."
-        SERVICE_STATE[network]="already configured"
-        return 0
+# Detects which network configuration system is actually in use, since this
+# script now targets both Ubuntu (netplan) and Debian (ifupdown by default,
+# NetworkManager on some installs). Nothing below assumes one specific tool.
+detect_netconf_backend() {
+    if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
+        echo "netplan"
+    elif command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        echo "networkmanager"
+    elif [[ -d /etc/network ]] && command -v ifup >/dev/null 2>&1; then
+        echo "ifupdown"
+    else
+        echo "unknown"
     fi
+}
 
-    # Detect other netplan files that already touch this interface
-    local other_files
-    other_files=$(grep -rl "$NETWORK_INTERFACE" /etc/netplan/*.yaml 2>/dev/null || true)
-    if [[ -n "$other_files" ]]; then
-        warn "Existing netplan file(s) already reference '$NETWORK_INTERFACE':"
-        echo "$other_files" | sed 's/^/    /'
-        warn "Review these manually if you see conflicting configuration after applying."
-    fi
-
-    echo
-    echo "WARNING:"
-    echo "Changing the network configuration may disconnect your SSH session."
-    echo
-    echo "Interface: $NETWORK_INTERFACE"
-    echo "Address:   ${SERVER_IP}/${NETWORK_CIDR}"
-    echo "Gateway:   ${GATEWAY:-<none - isolated lab>}"
-    echo
-    if ! prompt_yn "Apply this network configuration?" "N"; then
-        warn "Automatic network configuration skipped by user."
-        if [[ "$current_ip" != "$SERVER_IP" ]]; then
-            err "Required IP ${SERVER_IP} is not configured on ${NETWORK_INTERFACE}, and automatic"
-            err "network configuration was declined. Continuing would leave DNS/Apache/Postfix"
-            err "bound to an address that does not exist on this host."
-            echo
-            echo "Please either:"
-            echo "  1) Manually configure ${SERVER_IP}/${NETWORK_CIDR} on ${NETWORK_INTERFACE}, then re-run this script, or"
-            echo "  2) Re-run the wizard and enter the IP address actually assigned to this host."
-            exit 1
-        fi
-        return 0
-    fi
-
+apply_netplan() {
     local netplan_file="/etc/netplan/90-lab-server.yaml"
     backup_file "$netplan_file"
 
@@ -673,6 +656,158 @@ configure_network() {
             return 1
         fi
     fi
+}
+
+# Debian's default (non-cloud) install uses ifupdown with /etc/network/interfaces,
+# which -- unlike netplan -- has no built-in "try/auto-revert" safety net.
+apply_ifupdown() {
+    local if_file="/etc/network/interfaces.d/90-lab-server"
+    local main_if="/etc/network/interfaces"
+
+    if [[ -f "$main_if" ]] && ! grep -q "source.*interfaces\.d" "$main_if"; then
+        backup_file "$main_if"
+        echo "source /etc/network/interfaces.d/*" >> "$main_if"
+        info "Added 'source /etc/network/interfaces.d/*' to $main_if so drop-in files are used."
+    fi
+
+    mkdir -p /etc/network/interfaces.d
+    backup_file "$if_file"
+    local netmask
+    netmask=$(cidr_to_netmask "$NETWORK_CIDR")
+    {
+        echo "auto ${NETWORK_INTERFACE}"
+        echo "iface ${NETWORK_INTERFACE} inet static"
+        echo "    address ${SERVER_IP}"
+        echo "    netmask ${netmask}"
+        if [[ -n "$GATEWAY" ]]; then
+            echo "    gateway ${GATEWAY}"
+        fi
+        echo "    dns-nameservers 127.0.0.1"
+    } > "$if_file"
+    ok "ifupdown config written to $if_file (address ${SERVER_IP}, netmask ${netmask})."
+
+    warn "ifupdown has no automatic rollback like 'netplan try'. If this disconnects your"
+    warn "SSH session and the new address is unreachable, use console/VM access to restore"
+    warn "the backup from $BACKUP_DIR or edit $if_file directly."
+
+    ifdown "$NETWORK_INTERFACE" >>"$LOG_FILE" 2>&1 || warn "ifdown reported an issue (continuing) -- see $LOG_FILE."
+    if ifup "$NETWORK_INTERFACE" >>"$LOG_FILE" 2>&1; then
+        ok "Interface $NETWORK_INTERFACE brought up with the new address."
+        SERVICE_STATE[network]="configured"
+    else
+        err "ifup failed to bring $NETWORK_INTERFACE up with the new address -- see $LOG_FILE."
+        SERVICE_STATE[network]="failed"
+        return 1
+    fi
+}
+
+apply_networkmanager() {
+    local con_name
+    con_name=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="$NETWORK_INTERFACE" '$2==d{print $1; exit}')
+    if [[ -z "$con_name" ]]; then
+        con_name="lab-server-${NETWORK_INTERFACE}"
+        nmcli con add type ethernet ifname "$NETWORK_INTERFACE" con-name "$con_name" >>"$LOG_FILE" 2>&1
+    fi
+
+    nmcli con mod "$con_name" ipv4.addresses "${SERVER_IP}/${NETWORK_CIDR}" >>"$LOG_FILE" 2>&1
+    nmcli con mod "$con_name" ipv4.method manual >>"$LOG_FILE" 2>&1
+    nmcli con mod "$con_name" ipv4.dns "127.0.0.1" >>"$LOG_FILE" 2>&1
+    if [[ -n "$GATEWAY" ]]; then
+        nmcli con mod "$con_name" ipv4.gateway "$GATEWAY" >>"$LOG_FILE" 2>&1
+    else
+        nmcli con mod "$con_name" ipv4.gateway "" >>"$LOG_FILE" 2>&1
+    fi
+
+    if nmcli con up "$con_name" >>"$LOG_FILE" 2>&1; then
+        ok "NetworkManager connection '$con_name' brought up with the new address."
+        SERVICE_STATE[network]="configured"
+    else
+        err "nmcli failed to bring up '$con_name' with the new address -- see $LOG_FILE."
+        SERVICE_STATE[network]="failed"
+        return 1
+    fi
+}
+
+configure_network() {
+    local current_ip backend
+    current_ip=$(ip -o -4 addr show dev "$NETWORK_INTERFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    backend=$(detect_netconf_backend)
+
+    echo
+    echo "=========================================================="
+    echo " Interface          : $NETWORK_INTERFACE"
+    echo " Current IPv4 on it : ${current_ip:-none}"
+    echo " Requested Address  : ${SERVER_IP}/${NETWORK_CIDR}"
+    echo " Requested Gateway  : ${GATEWAY:-<none>}"
+    echo " Network backend    : ${backend}"
+    echo "=========================================================="
+
+    if [[ "$current_ip" == "$SERVER_IP" ]]; then
+        ok "Interface $NETWORK_INTERFACE already has the required IP. No network change needed."
+        SERVICE_STATE[network]="already configured"
+        return 0
+    fi
+
+    if [[ "$backend" == "unknown" ]]; then
+        err "Could not detect a supported network backend (netplan, ifupdown, or NetworkManager) on this host."
+        if [[ "$current_ip" != "$SERVER_IP" ]]; then
+            err "Required IP ${SERVER_IP} is not configured on ${NETWORK_INTERFACE}, and it cannot be set automatically."
+            echo "Please manually configure ${SERVER_IP}/${NETWORK_CIDR} on ${NETWORK_INTERFACE}, then re-run this script."
+            exit 1
+        fi
+        return 0
+    fi
+
+    case "$backend" in
+        netplan)
+            local other_files
+            other_files=$(grep -rl "$NETWORK_INTERFACE" /etc/netplan/*.yaml 2>/dev/null || true)
+            if [[ -n "$other_files" ]]; then
+                warn "Existing netplan file(s) already reference '$NETWORK_INTERFACE':"
+                echo "$other_files" | sed 's/^/    /'
+                warn "Review these manually if you see conflicting configuration after applying."
+            fi
+            ;;
+        ifupdown)
+            local other_refs
+            other_refs=$(grep -rl "$NETWORK_INTERFACE" /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | grep -v "90-lab-server" || true)
+            if [[ -n "$other_refs" ]]; then
+                warn "Existing ifupdown configuration already references '$NETWORK_INTERFACE':"
+                echo "$other_refs" | sed 's/^/    /'
+                warn "Review these manually if you see conflicting configuration after applying."
+            fi
+            ;;
+    esac
+
+    echo
+    echo "WARNING:"
+    echo "Changing the network configuration may disconnect your SSH session."
+    echo
+    echo "Interface: $NETWORK_INTERFACE"
+    echo "Address:   ${SERVER_IP}/${NETWORK_CIDR}"
+    echo "Gateway:   ${GATEWAY:-<none - isolated lab>}"
+    echo "Backend:   $backend"
+    echo
+    if ! prompt_yn "Apply this network configuration?" "N"; then
+        warn "Automatic network configuration skipped by user."
+        if [[ "$current_ip" != "$SERVER_IP" ]]; then
+            err "Required IP ${SERVER_IP} is not configured on ${NETWORK_INTERFACE}, and automatic"
+            err "network configuration was declined. Continuing would leave DNS/Apache/Postfix"
+            err "bound to an address that does not exist on this host."
+            echo
+            echo "Please either:"
+            echo "  1) Manually configure ${SERVER_IP}/${NETWORK_CIDR} on ${NETWORK_INTERFACE}, then re-run this script, or"
+            echo "  2) Re-run the wizard and enter the IP address actually assigned to this host."
+            exit 1
+        fi
+        return 0
+    fi
+
+    case "$backend" in
+        netplan) apply_netplan ;;
+        ifupdown) apply_ifupdown ;;
+        networkmanager) apply_networkmanager ;;
+    esac
 }
 
 # =============================================================================
