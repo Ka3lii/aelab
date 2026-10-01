@@ -668,13 +668,20 @@ apply_ifupdown() {
     local if_file="/etc/network/interfaces.d/90-lab-server"
     local main_if="/etc/network/interfaces"
 
-    if [[ -f "$main_if" ]] && ! grep -q "source.*interfaces\.d" "$main_if"; then
+    mkdir -p /etc/network/interfaces.d
+
+    # ifupdown reads drop-ins only when the main file includes them. Debian
+    # commonly uses either "source" or "source-directory" here; accept both
+    # and create the parent file when a minimal installation has neither.
+    if [[ ! -f "$main_if" ]]; then
+        touch "$main_if"
+    fi
+    if ! grep -qE '^[[:space:]]*(source|source-directory)[[:space:]]+/etc/network/interfaces\.d' "$main_if"; then
         backup_file "$main_if"
         echo "source /etc/network/interfaces.d/*" >> "$main_if"
         info "Added 'source /etc/network/interfaces.d/*' to $main_if so drop-in files are used."
     fi
 
-    mkdir -p /etc/network/interfaces.d
     backup_file "$if_file"
     local netmask
     netmask=$(cidr_to_netmask "$NETWORK_CIDR")
@@ -747,9 +754,21 @@ configure_network() {
     echo "=========================================================="
 
     if [[ "$current_ip" == "$SERVER_IP" ]]; then
-        ok "Interface $NETWORK_INTERFACE already has the required IP. No network change needed."
-        SERVICE_STATE[network]="already configured"
-        return 0
+        local persistent_ifupdown=0
+        if [[ -f /etc/network/interfaces.d/90-lab-server && -f /etc/network/interfaces ]] \
+            && grep -qE '^[[:space:]]*(source|source-directory)[[:space:]]+/etc/network/interfaces\.d' \
+                /etc/network/interfaces \
+            && grep -q "^[[:space:]]*address[[:space:]]\+${SERVER_IP}[[:space:]]*$" \
+                /etc/network/interfaces.d/90-lab-server; then
+            persistent_ifupdown=1
+        fi
+        if [[ "$backend" != "ifupdown" || "$persistent_ifupdown" -eq 1 ]]; then
+            ok "Interface $NETWORK_INTERFACE already has the required IP. No network change needed."
+            SERVICE_STATE[network]="already configured"
+            return 0
+        fi
+        warn "${SERVER_IP} is active, but the persistent ifupdown drop-in is missing or outdated."
+        warn "The ifupdown configuration will be written and the interface reloaded."
     fi
 
     if [[ "$backend" == "unknown" ]]; then
@@ -1246,6 +1265,35 @@ configure_dovecot() {
     # existing "service auth {" block. Uses a marker comment so re-running
     # this script never creates duplicate listener stanzas.
     backup_file /etc/dovecot/conf.d/10-master.conf
+
+    # Ubuntu/Debian often ship the IMAPS listener commented out. Enable it so
+    # the advertised 993/tcp service is actually available to mail clients.
+    if grep -qE '^[[:space:]]*inet_listener imaps[[:space:]]*\{' /etc/dovecot/conf.d/10-master.conf; then
+        sed -i -E '/^[[:space:]]*inet_listener imaps[[:space:]]*\{/,/^[[:space:]]*\}/ {
+            s/^([[:space:]]*)#?[[:space:]]*port[[:space:]]*=[[:space:]]*993[[:space:]]*$/\1port = 993/
+            s/^([[:space:]]*)#?[[:space:]]*ssl[[:space:]]*=[[:space:]]*yes[[:space:]]*$/\1ssl = yes/
+        }' /etc/dovecot/conf.d/10-master.conf
+    elif grep -qE '^[[:space:]]*service imap-login[[:space:]]*\{' /etc/dovecot/conf.d/10-master.conf; then
+        awk '
+            /service imap-login \{/ && !done {
+                print
+                print "  inet_listener imaps {"
+                print "    port = 993"
+                print "    ssl = yes"
+                print "  }"
+                done=1
+                next
+            }
+            { print }
+        ' /etc/dovecot/conf.d/10-master.conf > /tmp/10-master.conf.new \
+            && mv /tmp/10-master.conf.new /etc/dovecot/conf.d/10-master.conf
+    else
+        err "Could not find Dovecot service imap-login block; IMAPS listener was not configured."
+        SERVICE_STATE[dovecot_configured]="no"
+        SERVICE_STATE[dovecot_validated]="no"
+        return 1
+    fi
+
     if ! grep -q "LAB-SERVER-AUTH-SOCKET" /etc/dovecot/conf.d/10-master.conf; then
         awk '
             /service auth \{/ && !done {
@@ -1265,6 +1313,14 @@ configure_dovecot() {
         ok "Postfix SASL auth socket added to Dovecot (service auth block)."
     else
         info "Postfix SASL auth socket already present in Dovecot config -- skipped."
+    fi
+
+    if ! grep -q "LAB-SERVER-AUTH-SOCKET" /etc/dovecot/conf.d/10-master.conf \
+        || ! grep -q "/var/spool/postfix/private/auth" /etc/dovecot/conf.d/10-master.conf; then
+        err "Dovecot Postfix SASL auth socket is missing from service auth."
+        SERVICE_STATE[dovecot_configured]="no"
+        SERVICE_STATE[dovecot_validated]="no"
+        return 1
     fi
 
     backup_file /etc/dovecot/dovecot.conf
@@ -1306,11 +1362,11 @@ create_mail_user() {
     home_dir=$(getent passwd "$MAIL_TEST_USER" | cut -d: -f6)
     if [[ ! -d "${home_dir}/Maildir" ]]; then
         maildirmake.dovecot "${home_dir}/Maildir" 2>/dev/null || mkdir -p "${home_dir}/Maildir"/{cur,new,tmp}
-        chown -R "${MAIL_TEST_USER}:${MAIL_TEST_USER}" "${home_dir}/Maildir"
         ok "Maildir created for $MAIL_TEST_USER."
     else
         ok "Maildir already exists for $MAIL_TEST_USER."
     fi
+    chown -R "${MAIL_TEST_USER}:${MAIL_TEST_USER}" "${home_dir}/Maildir"
 }
 
 # =============================================================================
