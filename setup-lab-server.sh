@@ -487,7 +487,7 @@ wizard_features() {
 
     if [[ "$CLI_HTTPS" == "yes" ]]; then ENABLE_HTTPS="yes";
     elif [[ "$CLI_HTTPS" == "no" ]]; then ENABLE_HTTPS="no";
-    elif prompt_yn "Configure HTTPS with a self-signed certificate?" "Y"; then ENABLE_HTTPS="yes"; else ENABLE_HTTPS="no"; fi
+    elif prompt_yn "Configure HTTPS with a self-signed certificate? (mail TLS is configured separately)" "Y"; then ENABLE_HTTPS="yes"; else ENABLE_HTTPS="no"; fi
 
     if [[ "$CLI_UFW" == "yes" ]]; then ENABLE_UFW="yes";
     elif [[ "$CLI_UFW" == "no" ]]; then ENABLE_UFW="no";
@@ -1203,20 +1203,15 @@ configure_postfix() {
     fi
 
     backup_file /etc/postfix/master.cf
-    if ! grep -q "^submission inet" /etc/postfix/master.cf; then
-        cat >> /etc/postfix/master.cf <<EOF
-
-submission inet n       -       y       -       -       smtpd
-  -o syslog_name=postfix/submission
-  -o smtpd_tls_security_level=encrypt
-  -o smtpd_sasl_auth_enable=yes
-  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
-  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject_unauth_destination
-EOF
-        ok "Submission (587) service added to master.cf."
-    else
-        info "Submission (587) service already present in master.cf -- left as-is."
-    fi
+    # Update the distribution-provided service in place, including when it is
+    # commented out, so repeated runs never create duplicate listeners.
+    postconf -M "submission/inet=submission inet n       -       y       -       -       smtpd"
+    postconf -P "submission/inet/syslog_name=postfix/submission"
+    postconf -P "submission/inet/smtpd_tls_security_level=encrypt"
+    postconf -P "submission/inet/smtpd_sasl_auth_enable=yes"
+    postconf -P "submission/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject"
+    postconf -P "submission/inet/smtpd_relay_restrictions=permit_sasl_authenticated,reject_unauth_destination"
+    ok "Submission (587) service enabled and normalized in master.cf."
 
     SERVICE_STATE[postfix_configured]="yes"
     if postfix check 2>&1 | tee -a "$LOG_FILE"; then
@@ -1253,6 +1248,7 @@ configure_dovecot() {
     # submission (587) are how clients authenticate; plaintext auth over an
     # unencrypted channel is not permitted.
     set_or_append /etc/dovecot/conf.d/10-auth.conf "disable_plaintext_auth" "yes"
+    set_or_append /etc/dovecot/conf.d/10-auth.conf "auth_username_format" "%Ln"
 
     backup_file /etc/dovecot/conf.d/10-ssl.conf
     if [[ -f "$CERT_CRT" && -f "$CERT_KEY" ]]; then
@@ -1294,29 +1290,30 @@ configure_dovecot() {
         return 1
     fi
 
-    if ! grep -q "LAB-SERVER-AUTH-SOCKET" /etc/dovecot/conf.d/10-master.conf; then
-        awk '
-            /service auth \{/ && !done {
-                print
-                print "  # LAB-SERVER-AUTH-SOCKET (added by lab setup wizard, do not duplicate)"
-                print "  unix_listener /var/spool/postfix/private/auth {"
-                print "    mode = 0666"
-                print "    user = postfix"
-                print "    group = postfix"
-                print "  }"
-                done=1
-                next
-            }
-            { print }
-        ' /etc/dovecot/conf.d/10-master.conf > /tmp/10-master.conf.new \
-            && mv /tmp/10-master.conf.new /etc/dovecot/conf.d/10-master.conf
-        ok "Postfix SASL auth socket added to Dovecot (service auth block)."
+    # Keep our socket in a dedicated drop-in instead of injecting text into
+    # 10-master.conf, whose formatting and surrounding comments may change.
+    local auth_socket_conf="/etc/dovecot/conf.d/99-lab-server-auth.conf"
+    backup_file "$auth_socket_conf"
+    if ! grep -RqsE '^[[:space:]]*unix_listener[[:space:]]+/var/spool/postfix/private/auth[[:space:]]*\{' \
+        /etc/dovecot/conf.d; then
+        cat > "$auth_socket_conf" <<'EOF'
+# Postfix SASL socket managed by setup-lab-server.sh.
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+EOF
+        chmod 644 "$auth_socket_conf"
+        ok "Postfix SASL auth socket configured in a dedicated Dovecot drop-in."
     else
-        info "Postfix SASL auth socket already present in Dovecot config -- skipped."
+        info "Postfix SASL auth socket already present in Dovecot configuration -- skipped."
     fi
 
-    if ! grep -q "LAB-SERVER-AUTH-SOCKET" /etc/dovecot/conf.d/10-master.conf \
-        || ! grep -q "/var/spool/postfix/private/auth" /etc/dovecot/conf.d/10-master.conf; then
+    if ! grep -RqsE '^[[:space:]]*unix_listener[[:space:]]+/var/spool/postfix/private/auth[[:space:]]*\{' \
+        /etc/dovecot/conf.d; then
         err "Dovecot Postfix SASL auth socket is missing from service auth."
         SERVICE_STATE[dovecot_configured]="no"
         SERVICE_STATE[dovecot_validated]="no"
@@ -1366,6 +1363,7 @@ create_mail_user() {
     else
         ok "Maildir already exists for $MAIL_TEST_USER."
     fi
+    chmod 700 "${home_dir}/Maildir"
     chown -R "${MAIL_TEST_USER}:${MAIL_TEST_USER}" "${home_dir}/Maildir"
 }
 

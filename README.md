@@ -80,6 +80,7 @@ as a command-line argument.
 - **Postfix:** SMTP on port 25 and authenticated submission on port 587, with
 	relay restrictions to prevent unauthenticated relaying.
 - **Dovecot:** IMAP over TLS on port 993. Plaintext authentication is disabled.
+	Mail TLS is configured independently of the optional web HTTPS setting.
 - **Mail test account:** a local user with a Maildir and a password entered in
 	the wizard.
 - **UFW:** optional rules for SSH, DNS, HTTP, SMTP, submission, IMAPS, and
@@ -114,6 +115,11 @@ final report distinguishing configuration from successful validation.
 - Log: `/var/log/lab-server-setup.log`
 - Per-run backups: `/var/backups/lab-server-setup/<timestamp>/`
 - TLS files when HTTPS is enabled: `/etc/ssl/lab-server/`
+
+The generated certificate is self-signed and is suitable for this isolated
+lab, but mail clients will show a trust warning until the certificate is
+installed in their trust store. Use a certificate from a trusted CA for
+internet-facing mail.
 
 Review the final report and log before treating the lab server as ready. A
 non-`/24` network is accepted, but reverse DNS generation is based on the
